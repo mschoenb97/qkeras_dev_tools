@@ -35,7 +35,7 @@ class quantized_bits2(BaseQuantizer):
         3. Round to the nearest integer (the "integer representation")
         4. Scale back by 1/factor
 
-    This range is determined by
+    This "integer representation" range is determined by
         - The number of bits we have to represent the number
         - Whether we want to have a symmetric range or not
         - Whether we want to keep negative numbers or not
@@ -91,8 +91,10 @@ class quantized_bits2(BaseQuantizer):
         function: Function that computes fixed-point quantization with bits.
 
     Raises:
-        ValueError: If bits is not positive, or is too small to represent integer.
-            Or, if alpha is a string but not one of ("auto", "auto_po2").
+        ValueError:
+            - If bits is not positive, or is too small to represent integer.
+            - If integer is negative.
+            - If alpha is a string but not one of ("auto", "auto_po2").
 
     """
 
@@ -120,7 +122,6 @@ class quantized_bits2(BaseQuantizer):
         use_ste=True,
         use_variables=False,
     ):
-
         super().__init__()
 
         # Set _initialized parameter to False to prevent the setters from
@@ -137,6 +138,9 @@ class quantized_bits2(BaseQuantizer):
         self.scale_axis = scale_axis
         self.var_name = var_name
         self.use_variables = use_variables
+        # set scale as a tf.Variable so that it can be updated
+        # within tf.functions
+        self.scale = tf.Variable(1.0, name="scale", shape=tf.TensorShape(None))
 
         # Perform preliminary calculations based on attributes above
         self._initialized = True
@@ -331,15 +335,10 @@ class quantized_bits2(BaseQuantizer):
     def _multi_bit_computation(self, x):
         """Quantization multi-bit representation- differs for auto and static alpha"""
 
-        # Quantization functions for tf.cond below
-        def static_alpha_computation():
-            return self._static_alpha_computation(x)
-
-        def auto_alpha_computation():
-            return self._auto_alpha_computation(x)
-
         xq = tf.cond(
-            self.auto_alpha, auto_alpha_computation, static_alpha_computation
+            self.auto_alpha,
+            lambda: self._auto_alpha_computation(x),
+            lambda: self._static_alpha_computation(x),
         )
 
         return xq
@@ -354,24 +353,21 @@ class quantized_bits2(BaseQuantizer):
         def autoscale():
             """Quantize with `alpha_scale` above"""
             int_xq = self._get_quantized_integer(x, alpha_scale)
-            tf.print("alpha_scale", alpha_scale)
-            self.scale = alpha_scale / self.integer_repr_scale
-            tf.print('scale', self.scale)
-            return int_xq * alpha_scale
+            return alpha_scale, int_xq * alpha_scale
 
         def po2_autoscale():
             """Get the "best" po2 scale for the data"""
             _alpha_scale, int_xq = self._po2_autoscale(x, alpha_scale)
-            tf.print("po2 alpha_scale", _alpha_scale)
-            self.scale = _alpha_scale / self.integer_repr_scale
-            return int_xq * _alpha_scale
+            return _alpha_scale, int_xq * _alpha_scale
 
-        xq = tf.case(
+        alpha_scale, xq = tf.case(
             [
                 (tf.equal(self.alpha, self.AUTO_ALPHA_ENUM), autoscale),
                 (tf.equal(self.alpha, self.AUTO_PO2_ALPHA_ENUM), po2_autoscale),
             ],
         )
+
+        self.scale.assign(alpha_scale / self.integer_repr_scale)
 
         return xq
 
@@ -383,8 +379,7 @@ class quantized_bits2(BaseQuantizer):
 
         xq = tf.where(tf.math.greater_equal(x, 0), nonneg_res, neg_res)
 
-        tf.print("sign function")
-        self.scale = self.alpha
+        self.scale.assign(self.alpha)
 
         return xq * self.alpha
 
@@ -394,8 +389,7 @@ class quantized_bits2(BaseQuantizer):
         int_xq = self._get_quantized_integer(x, self.integer_repr_scale)
         xq = int_xq * self.integer_repr_scale
 
-        tf.print("static alpha")
-        self.scale = self.alpha
+        self.scale.assign(self.alpha)
 
         return xq * self.alpha
 
@@ -417,12 +411,21 @@ class quantized_bits2(BaseQuantizer):
 
         axis = self._get_axis(x)
 
-        if self.keep_negative:
-            alpha_scale = (
-                K.max(tf.math.abs(x), axis=axis, keepdims=True) * 2
-            ) / self.levels
-        else:
-            alpha_scale = K.max(x, axis=axis, keepdims=True) / self.levels
+        def alpha_scale_keep_negative():
+            """Get alpha scale when keeping negative values"""
+
+            return (K.max(tf.math.abs(x), axis=axis, keepdims=True) * 2) / self.levels
+
+        def alpha_scale_no_negative():
+            """Get alpha scale when dropping negative values"""
+
+            return K.max(x, axis=axis, keepdims=True) / self.levels
+
+        alpha_scale = tf.cond(
+            tf.equal(self.keep_negative, 1.0),
+            alpha_scale_keep_negative,
+            alpha_scale_no_negative,
+        )
 
         return tf.math.maximum(alpha_scale, K.epsilon())
 
@@ -430,12 +433,11 @@ class quantized_bits2(BaseQuantizer):
         """Get axis for alpha scale computation"""
 
         len_axis = tf.rank(x)
-        if len_axis != 1:
-            axis = _get_scaling_axis(
-                self.scale_axis, len_axis
-            )
-        else:
-            axis = tf.convert_to_tensor([0])
+        axis = tf.cond(
+            tf.not_equal(len_axis, 1),
+            lambda: _get_scaling_axis(self.scale_axis, len_axis),
+            lambda: tf.convert_to_tensor([0]),
+        )
         return axis
 
     def _po2_autoscale(self, x, alpha_scale):
@@ -445,17 +447,7 @@ class quantized_bits2(BaseQuantizer):
             2.0, tf.math.round(K.log(alpha_scale + K.epsilon()) / np.log(2.0))
         )
 
-        # hack for 1-D arrays. Need alpha scale to be the same shape as x
-        # for tf.loop to work
-        # alpha_scale = tf.cond(
-        #     tf.equal(tf.rank(x), 1),
-        #     lambda: alpha_scale * tf.ones_like(x),
-        #     lambda: alpha_scale,
-        # )
-
-        alpha_scale = alpha_scale * tf.ones_like(x)
-
-        def loop_body(_, alpha_scale, __, iteration_count):
+        def loop_body(_, alpha_scale, __):
             """Loop body for least squares autoscaling"""
 
             int_xq = self._get_quantized_integer(x, alpha_scale)
@@ -465,24 +457,30 @@ class quantized_bits2(BaseQuantizer):
                 q=int_xq,
                 scale_axis=self.scale_axis,
             )
-            return alpha_scale, new_alpha_scale, int_xq, iteration_count + 1
+            return alpha_scale, new_alpha_scale, int_xq
 
-        def loop_cond(last_alpha_scale, alpha_scale, __, iteration_count):
+        def loop_cond(last_alpha_scale, alpha_scale, __):
             """Loop condition for least squares autoscaling- stop when the scale
             converges or after 5 iterations"""
 
             tensors_not_equal = tf.math.reduce_any(
                 tf.not_equal(last_alpha_scale, alpha_scale)
             )
-            iterations_incomplete = tf.math.less(iteration_count, 5)
-            return tf.math.logical_and(tensors_not_equal, iterations_incomplete)
+            return tensors_not_equal
 
+        # Need a tensor of the same shape as alpha_scale that is not equal to alpha_scale
         dummy_alpha_scale = -tf.ones_like(alpha_scale)
 
-        _, alpha_scale, int_xq, __ = tf.while_loop(
+        _, alpha_scale, int_xq = tf.while_loop(
             loop_cond,
             loop_body,
-            (dummy_alpha_scale, alpha_scale, x, 0),
+            (dummy_alpha_scale, alpha_scale, x),
+            shape_invariants=(
+                alpha_scale.shape,
+                alpha_scale.shape,
+                tf.TensorShape(None),
+            ),
+            maximum_iterations=5,
         )  # x and dummy_alpha_scale not used as inputs, just needed to determine shapes
 
         return alpha_scale, int_xq
@@ -515,134 +513,6 @@ def _get_scaling_axis(scale_axis, len_axis):
         else:
             axis = tf.range(1, len_axis)
     return axis
-
-
-# def _get_scale(alpha, x, q, scale_axis=None, per_channel_scale=True):
-#   """Gets scaling factor for scaling the tensor per channel.
-#   It uses the least squares method to find the scaling factor.
-#
-#   (https://en.wikipedia.org/wiki/Linear_least_squares)
-#
-#   Arguments:
-#     alpha: A float or string. When it is string, it should be either "auto" or
-#       "auto_po2", and scale = sum(x * q, axis=all but last) / sum(q * q,
-#       axis=all but last)
-#      x: A tensor object. Its elements are in float.
-#      q: A tensor object. Its elements are in quantized format of x.
-#      scale_axis: which axis to calculate scale from
-#      per_channel_scale: A bool. Whether to perform per-channel scaling or not.
-#
-#   Returns:
-#     A scaling factor tensor or scalar for scaling tensor per channel.
-#   """
-#
-#   if isinstance(alpha, six.string_types) and "auto" in alpha:
-#     assert alpha in ["auto", "auto_po2"]
-#     # in different tensorflow version (e.g., 2.4)
-#     # x.shape is a tuple which doesn't have as_list() method
-#     try:
-#       x_shape = x.shape.as_list()
-#     except AttributeError:
-#       x_shape = list(x.shape)
-#
-#     len_axis = len(x_shape)
-#     if not per_channel_scale:
-#       qx = K.mean(x * q, keepdims=True)
-#       qq = K.mean(q * q, keepdims=True)
-#     else:
-#       if len_axis > 1:
-#         axis = _get_scaling_axis(scale_axis, len_axis)
-#         qx = K.mean(tf.math.multiply(x, q), axis=axis, keepdims=True)
-#         qq = K.mean(tf.math.multiply(q, q), axis=axis, keepdims=True)
-#       else:
-#         # No summing (averaging) along the channel axis to get per-channel
-#         # scales.
-#         qx = x * q
-#         qq = q * q
-#
-#     scale = qx / (qq + K.epsilon())
-#     if alpha == "auto_po2":
-#       scale = K.pow(K.cast_to_floatx(2.0),
-#                     K.cast_to_floatx(tf.math.round(K.log(scale + K.epsilon()) / np.log(2.0))))
-#   elif alpha is None:
-#     scale = 1.0
-#   elif isinstance(alpha, np.ndarray):
-#     scale = alpha
-#   else:
-#     scale = float(alpha)
-#   return scale
-
-# def _get_scaling_axis(scale_axis, len_axis, default_scale_axis=True):
-#     """Get the axis to perform auto scaling with"""
-#
-#     if not default_scale_axis:
-#         axis = tf.range(scale_axis)
-#         axis = tf.concat([axis, tf.range(scale_axis + 1, len_axis)], axis=0)
-#     else:
-#         if K.image_data_format() == "channels_last":
-#             axis = tf.range(len_axis - 1)
-#         else:
-#             axis = tf.range(1, len_axis)
-#     return axis
-#
-#
-# def _get_scale(
-#     alpha, x, q, scale_axis=0, per_channel_scale=True, default_scale_axis=True
-# ):
-#     """Gets scaling factor for scaling the tensor per channel.
-#     It uses the least squares method to find the scaling factor.
-#
-#     (https://en.wikipedia.org/wiki/Linear_least_squares)
-#
-#     Arguments:
-#       alpha: A float or string. When it is string, it should be either "auto" or
-#         "auto_po2", and scale = sum(x * q, axis=all but last) / sum(q * q,
-#         axis=all but last)
-#        x: A tensor object. Its elements are in float.
-#        q: A tensor object. Its elements are in quantized format of x.
-#        scale_axis: which axis to calculate scale from
-#        per_channel_scale: A bool. Whether to perform per-channel scaling or not.
-#
-#     Returns:
-#       A scaling factor tensor or scalar for scaling tensor per channel.
-#     """
-#
-#     if isinstance(alpha, six.string_types) and "auto" in alpha:
-#         assert alpha in ["auto", "auto_po2"]
-#         # in different tensorflow version (e.g., 2.4)
-#         # x.shape is a tuple which doesn't have as_list() method
-#         try:
-#             x_shape = x.shape.as_list()
-#         except AttributeError:
-#             x_shape = list(x.shape)
-#
-#         len_axis = len(x_shape)
-#         if not per_channel_scale:
-#             qx = K.mean(x * q, keepdims=True)
-#             qq = K.mean(q * q, keepdims=True)
-#         else:
-#             if len_axis > 1:
-#                 axis = _get_scaling_axis(
-#                     scale_axis, len_axis, default_scale_axis=default_scale_axis
-#                 )
-#                 qx = K.mean(tf.math.multiply(x, q), axis=axis, keepdims=True)
-#                 qq = K.mean(tf.math.multiply(q, q), axis=axis, keepdims=True)
-#             else:
-#                 # No summing (averaging) along the channel axis to get per-channel
-#                 # scales.
-#                 qx = x * q
-#                 qq = q * q
-#
-#         scale = qx / (qq + K.epsilon())
-#         if alpha == "auto_po2":
-#             scale = K.pow(2.0, tf.math.round(K.log(scale + K.epsilon()) / np.log(2.0)))
-#     elif alpha is None:
-#         scale = 1.0
-#     elif isinstance(alpha, np.ndarray):
-#         scale = alpha
-#     else:
-#         scale = float(alpha)
-#     return scale
 
 
 def _round_through(x, use_stochastic_rounding=False, precision=0.5):
@@ -687,5 +557,6 @@ def _round_through(x, use_stochastic_rounding=False, precision=0.5):
 
     output = tf.case(conditions, exclusive=True)
     return output
+
 
 get_time_info(__file__)

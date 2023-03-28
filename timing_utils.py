@@ -32,14 +32,12 @@ def get_time_info(filepath):
 
 
 def hardware_timeit(func, *, hardware, data_shapes, max_iterations=1, max_time=None):
-
     assert hardware in ("/CPU:0", "/GPU:0", "/TPU:0")
     max_time = float("inf") if max_time is None else max_time
 
     res = []
 
     for shape in data_shapes:
-
         sub_res = {}
         iterations = 0
         total_time = 0
@@ -78,7 +76,6 @@ def _quantized_bits_speed_test_data(
     max_time=None,
     quantized_bits_kwargs=None,
 ):
-
     kwargs = {
         "hardware": hardware,
         "data_shapes": data_shapes,
@@ -101,7 +98,6 @@ def _quantized_bits_speed_test_data(
 def quantized_bits_speed_tests(
     *args, plot=False, error_bars=False, field="avg_time", **kwargs
 ):
-
     baseline_times, alt_times = _quantized_bits_speed_test_data(*args, **kwargs)
 
     if plot:

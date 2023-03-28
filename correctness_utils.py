@@ -40,7 +40,6 @@ TEST_X_VALUES = (
 
 
 def quantized_bits_grid_accuracy_tests(alt_quantized_bits, max_test_count=None):
-
     param_grid = list(product(*QUANTIZED_BITS_PARAMS.values()))
     random.shuffle(param_grid)
 
@@ -48,7 +47,6 @@ def quantized_bits_grid_accuracy_tests(alt_quantized_bits, max_test_count=None):
         param_grid = param_grid[:max_test_count]
 
     for params in tqdm(param_grid, desc="Accuracy tests (grid)"):
-
         kwargs = dict(zip(QUANTIZED_BITS_PARAMS.keys(), params))
 
         _check_quantized_bits_correctness(alt_quantized_bits, kwargs)
@@ -76,7 +74,7 @@ def quantized_bits_linear_accuracy_tests(alt_quantized_bits):
             kwargs = {param_name: param_value}
             linear_kwargs_list.append(kwargs)
 
-    kwargs_list = linear_kwargs_list + extra_kwargs_list
+    kwargs_list = extra_kwargs_list + linear_kwargs_list
 
     for kwargs in tqdm(kwargs_list, desc="Accuracy tests (linear)"):
         _check_quantized_bits_correctness(alt_quantized_bits, kwargs)
@@ -119,9 +117,9 @@ def _check_correctness(alt_func, baseline_func, x, kwargs):
         baseline_scale = np.array(baseline_func.scale)
         alt_scale = np.array(alt_func.scale)
     err_msg = (
-        f"Failed for {kwargs} with {x = }. \n"
-        f"{baseline_res = }, {alt_res = }. \n"
-        f"{baseline_scale = }, {alt_scale = }"
+        f"Failed for {kwargs} with x = {x}. \n"
+        f"baseline_res = {baseline_res}, alt_res = {alt_res}. \n"
+        f"baseline_scale = {baseline_scale}, alt_scale = {alt_scale}"
     )
     if not np.allclose(baseline_res, alt_res):
         assert False, err_msg
