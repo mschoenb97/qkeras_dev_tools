@@ -15,7 +15,7 @@ from tensorflow.keras.utils import deserialize_keras_object
 from tensorflow.python.framework import smart_cond as tf_utils
 
 from qkeras import BaseQuantizer, stochastic_round
-from qkeras.quantizers import _get_scale
+from qkeras.quantizers import _get_scale, _round_through
 from pprint import pprint
 
 from timing_utils import get_time_info
@@ -73,7 +73,7 @@ class quantized_bits2(BaseQuantizer):
             the minimum floating point scale that does not clip the max of x.
             if "auto_po2", the scaling factor is chosen as the power of two that
             minimizes squared error between the scaled quantized x and the original x.
-        keep_negative (bool): If true, we do not clip negative numbers.
+        keep_negative (bool): If false, we clip negative numbers.
         use_stochastic_rounding (bool): If true, we perform stochastic rounding.
         scale_axis (int): Which axis to calculate scale from.
         qnoise_factor (float): A scalar from 0 to 1 that represents the level of
@@ -140,7 +140,8 @@ class quantized_bits2(BaseQuantizer):
         self.use_variables = use_variables
         # set scale as a tf.Variable so that it can be updated
         # within tf.functions
-        self.scale = tf.Variable(1.0, name="scale", shape=tf.TensorShape(None))
+        self.scale = tf.Variable(
+            1.0, name="scale", shape=tf.TensorShape(None), trainable=False)
 
         # Perform preliminary calculations based on attributes above
         self._initialized = True
@@ -260,7 +261,7 @@ class quantized_bits2(BaseQuantizer):
     def _check_str_alpha(self, alpha):
         """Check the quantizer has been given a valid alpha string"""
 
-        alpha_options = dict(self.ALPHA_STRING_TO_ENUM).keys()
+        alpha_options = list(dict(self.ALPHA_STRING_TO_ENUM))
         if not alpha in alpha_options:
             raise ValueError(
                 f"Invalid alpha '{alpha}' for auto alpha computation. "
@@ -272,6 +273,7 @@ class quantized_bits2(BaseQuantizer):
         assert (
             self._initialized
         ), "Must initialize before calling _calc_input_independent_attributes"
+
         self._set_unsigned_bits()
         self._set_sign_function()
         self._set_integer_repr_scale()
@@ -315,7 +317,7 @@ class quantized_bits2(BaseQuantizer):
         self.int_repr_max = int_repr_max
         self.levels = self.int_repr_max - self.int_repr_min
 
-    @tf.function
+    # @tf.function
     def __call__(self, x):
         """Core quantization function"""
         # build if not done so already
@@ -404,7 +406,8 @@ class quantized_bits2(BaseQuantizer):
             precision=1.0,
         )
 
-        return int_xq
+        # stop gradient to prevent backprop through rounding
+        return clipped_scaled_x + tf.stop_gradient(int_xq - clipped_scaled_x)
 
     def _get_alpha_scale(self, x):
         """Get the minimum floating point scale that does not clip the max of x"""
@@ -490,9 +493,9 @@ class quantized_bits2(BaseQuantizer):
 
         return tf.cond(
             self.use_ste,
-            lambda: x + tf.stop_gradient(self.qnoise_factor * (-x + xq)),
+            lambda: x + self.qnoise_factor * (-x + xq),
             lambda: (1 - self.qnoise_factor) * x
-            + tf.stop_gradient(self.qnoise_factor * xq),
+            + self.qnoise_factor * xq,
         )
 
     def _build(self):
@@ -513,50 +516,6 @@ def _get_scaling_axis(scale_axis, len_axis):
         else:
             axis = tf.range(1, len_axis)
     return axis
-
-
-def _round_through(x, use_stochastic_rounding=False, precision=0.5):
-    """Rounds x but using straight through estimator.
-
-    We use the trick from [Sergey Ioffe](http://stackoverflow.com/a/36480182).
-
-    Straight through estimator is a biased estimator for the rounding
-    operation defined by Hinton"s Coursera Lecture 9c where dL/dx is made
-    equal to dL/dy for y = f(x) during gradient computation, where f(x) is
-    a non-derivable function. In that case, we assume df/dx = 1 in:
-
-    dL   dL df   dL
-    -- = -- -- = --
-    dx   df dx   dy
-
-    (https://www.youtube.com/watch?v=LN0xtUuJsEI&list=PLoRl3Ht4JOcdU872GhiYWf6jwrk_SNhz9&index=41)
-
-    Arguments:
-      x: tensor to perform round operation with straight through gradient.
-      use_stochastic_rounding: if true, we perform stochastic rounding.
-      precision: by default we will use 0.5 as precision, but that can overriden
-        by the user.
-
-    Returns:
-      Rounded tensor.
-    """
-    conditions = [
-        (
-            use_stochastic_rounding,
-            lambda: tf_utils.smart_cond(
-                K.learning_phase(),
-                lambda: x + tf.stop_gradient(-x + stochastic_round(x, precision)),
-                lambda: x + tf.stop_gradient(-x + tf.round(x)),
-            ),
-        ),
-        (
-            tf.ones_like(use_stochastic_rounding, dtype=tf.bool),
-            lambda: x + tf.stop_gradient(-x + tf.round(x)),
-        ),
-    ]
-
-    output = tf.case(conditions, exclusive=True)
-    return output
 
 
 get_time_info(__file__)

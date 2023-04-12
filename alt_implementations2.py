@@ -18,7 +18,6 @@ from timing_utils import get_time_info
 
 
 class quantized_bits3(BaseQuantizer):
-
     ALPHA_OPTIONS = ("auto", "auto_po2")
 
     def __init__(
@@ -33,7 +32,6 @@ class quantized_bits3(BaseQuantizer):
         alpha=None,
         scale_axis=None,
     ):
-
         super().__init__()
 
         self.bits = K.cast_to_floatx(bits)
