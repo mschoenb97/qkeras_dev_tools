@@ -406,8 +406,7 @@ class quantized_bits2(BaseQuantizer):
             precision=1.0,
         )
 
-        # stop gradient to prevent backprop through rounding
-        return clipped_scaled_x + tf.stop_gradient(int_xq - clipped_scaled_x)
+        return int_xq
 
     def _get_alpha_scale(self, x):
         """Get the minimum floating point scale that does not clip the max of x"""
