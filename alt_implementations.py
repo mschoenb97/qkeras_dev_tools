@@ -40,13 +40,18 @@ class quantized_bits2(BaseQuantizer):
         - Whether we want to have a symmetric range or not
         - Whether we want to keep negative numbers or not
 
-    The scale is defined by either the user or the quantizer itself.
-    # TODO: Add more details about the scale.
+    The scale is defined by either the user or the quantizer itself,
+    using the parameters `integer` or `alpha`. If `alpha` is None, `integer`
+    defines the number of integer bits, which determines the scale.
+    Otherwise `alpha` must be a string, which specifies the method of
+    automatically determining the scale per-channel.
 
-    The quantizer also supports a number of other optional features:
-        - Stochastic rounding
+    For backprop purposes, the quantizer uses the straight-through estimator
+    for the rounding step.
+
+        The quantizer also supports a number of other optional features:
+        - Stochastic rounding (https://arxiv.org/pdf/1502.02551.pdf)
         - Quantization noise
-        - Straight-through estimator activation
 
     Example:
         ```python
@@ -68,11 +73,11 @@ class quantized_bits2(BaseQuantizer):
         integer (int): Number of bits to the left of the decimal point.
         symmetric (bool): If true, we will have the same number of values for positive
             and negative numbers.
-        alpha (tensor, str, None): The scaling factor per channel. If None, the scaling factor
-            is 1 for all channels. If "auto", scaling factor is calculated as
-            the minimum floating point scale that does not clip the max of x.
-            if "auto_po2", the scaling factor is chosen as the power of two that
-            minimizes squared error between the scaled quantized x and the original x.
+        alpha (str, None): The auto-scaling method. If None, the scaling factor
+            is determined by `integer`. If "auto", the scaling factor is calculated
+            as the minimum floating point scale that does not clip the max of x.
+            if "auto_po2", the scaling factor is chosen as the power of two per-channel
+            that minimizes squared error between the quantized x and the original x.
         keep_negative (bool): If false, we clip negative numbers.
         use_stochastic_rounding (bool): If true, we perform stochastic rounding.
         scale_axis (int): Which axis to calculate scale from.
@@ -82,8 +87,6 @@ class quantized_bits2(BaseQuantizer):
             (1 - qnoise_factor) * unquantized_x + qnoise_factor * quantized_x.
         var_name (str or None): A variable name shared between the tf.Variables
             created in the build function. If None, it is generated automatically.
-        use_ste (bool): Whether to use "straight-through estimator" (STE) method or
-            not. (Reference: https://arxiv.org/pdf/1903.05662.pdf)
         use_variables (bool): Whether to make the quantizer variables to be dynamic
             tf.Variables or not.
 
@@ -98,15 +101,7 @@ class quantized_bits2(BaseQuantizer):
 
     """
 
-    # alpha enum- need for uniform typing of alpha for auto-alpha options
-    AUTO_ALPHA_ENUM = K.cast_to_floatx(1.0)
-    AUTO_PO2_ALPHA_ENUM = K.cast_to_floatx(2.0)
-
-    # immutable map of alpha strings to alpha enum
-    ALPHA_STRING_TO_ENUM = (
-        ("auto", AUTO_ALPHA_ENUM),
-        ("auto_po2", AUTO_PO2_ALPHA_ENUM),
-    )
+    ALPHA_OPTIONS = ("auto", "auto_po2")
 
     def __init__(
         self,
@@ -119,7 +114,6 @@ class quantized_bits2(BaseQuantizer):
         scale_axis=None,
         qnoise_factor=1.0,
         var_name=None,
-        use_ste=True,
         use_variables=False,
     ):
         super().__init__()
@@ -133,7 +127,6 @@ class quantized_bits2(BaseQuantizer):
         self.keep_negative = keep_negative
         self.qnoise_factor = qnoise_factor
         self.use_stochastic_rounding = use_stochastic_rounding
-        self.use_ste = use_ste
         self.alpha = alpha
         self.scale_axis = scale_axis
         self.var_name = var_name
@@ -141,17 +134,16 @@ class quantized_bits2(BaseQuantizer):
         # set scale as a tf.Variable so that it can be updated
         # within tf.functions
         self.scale = tf.Variable(
-            1.0, name="scale", shape=tf.TensorShape(None), trainable=False)
+            1.0, name="scale", shape=tf.TensorShape(None), trainable=False
+        )
 
         # Perform preliminary calculations based on attributes above
         self._initialized = True
         self._calc_input_independent_attributes()
 
         # Auto-scaling not needed for sign quantization
-        # TODO: make sure this is needed
         if self.auto_alpha and self.use_sign_function:
-            self.auto_alpha = tf.cast(False, tf.bool)
-            self.alpha = K.cast_to_floatx(1.0)
+            self.alpha = None
 
     @property
     def bits(self):
@@ -214,14 +206,6 @@ class quantized_bits2(BaseQuantizer):
         self._use_stochastic_rounding = tf.cast(use_stochastic_rounding, tf.bool)
 
     @property
-    def use_ste(self):
-        return self._use_ste
-
-    @use_ste.setter
-    def use_ste(self, use_ste):
-        self._use_ste = tf.cast(use_ste, tf.bool)
-
-    @property
     def scale_axis(self):
         return self._scale_axis
 
@@ -238,35 +222,24 @@ class quantized_bits2(BaseQuantizer):
         """
         Set alpha and auto_alpha attributes, and check if alpha is valid
         Also, set scale if not auto_alpha.
-
-        Alpha can be passed in as a string (e.g. "auto", indicating a
-        data-dependent alpha) or a tensor. In order to avoid typing issues with
-        the construction of tensorflow graphs, we want the represent the alpha
-        using uniform data types. Therefore, we convert the string to an enum (tensor),
-        and then store a boolean auto_alpha to indicate whether the alpha is dependent
-        on the data or not.
         """
 
         if alpha is None:
-            self._alpha = K.cast_to_floatx(1.0)
+            # TODO: make sure this is the right idea
+            self._alpha = None
+
+            # scale is always 1 for non-auto alpha
+            self.scale.assign(K.cast_to_floatx(1.0))
             self.auto_alpha = tf.cast(False, tf.bool)
-        elif isinstance(alpha, six.string_types):
-            self._check_str_alpha(alpha)
-            self._alpha = dict(self.ALPHA_STRING_TO_ENUM)[alpha]
-            self.auto_alpha = tf.cast(True, tf.bool)
         else:
-            self._alpha = K.cast_to_floatx(alpha)
-            self.auto_alpha = tf.cast(False, tf.bool)
-
-    def _check_str_alpha(self, alpha):
-        """Check the quantizer has been given a valid alpha string"""
-
-        alpha_options = list(dict(self.ALPHA_STRING_TO_ENUM))
-        if not alpha in alpha_options:
-            raise ValueError(
-                f"Invalid alpha '{alpha}' for auto alpha computation. "
-                f"Must be one of {alpha_options}"
-            )
+            # Check the quantizer has been given a valid alpha string
+            if not alpha in self.ALPHA_OPTIONS:
+                raise ValueError(
+                    f"Invalid alpha '{alpha}' for auto alpha computation. "
+                    f"Must be one of {self.ALPHA_OPTIONS}"
+                )
+            self._alpha = tf.cast(alpha, tf.string)
+            self.auto_alpha = tf.cast(True, tf.bool)
 
     def _calc_input_independent_attributes(self):
         """Calculate and set attributes that are independent of __call__ input"""
@@ -274,14 +247,7 @@ class quantized_bits2(BaseQuantizer):
             self._initialized
         ), "Must initialize before calling _calc_input_independent_attributes"
 
-        self._set_unsigned_bits()
-        self._set_sign_function()
-        self._set_integer_repr_scale()
-        self._set_int_repr_bounds()
-
-    def _set_unsigned_bits(self):
-        """Compute unsigned bits scale (for integer representation), and store as attribute"""
-
+        # Compute unsigned bits scale (for integer representation), and store as attribute
         self.unsigned_bits = self.bits - self.keep_negative
         if self.unsigned_bits < self.integer:
             err_msg = (
@@ -289,14 +255,10 @@ class quantized_bits2(BaseQuantizer):
             )
             raise ValueError(err_msg)
 
-    def _set_sign_function(self):
-        """Set boolean based on whether to use sign function"""
-
+        # Set boolean based on whether to use sign function
         self.use_sign_function = tf.cast(self.unsigned_bits == 0, tf.bool)
 
-    def _set_integer_repr_scale(self):
-        """Get scale for integer representation, as given by parameters other than alpha
-        Store as an attribute"""
+        # Get scale for integer representation, as given by parameters other than alpha
         integer_repr_scale = tf.math.reciprocal(
             K.cast_to_floatx(
                 tf.bitwise.left_shift(1, self.unsigned_bits - self.integer)
@@ -304,8 +266,7 @@ class quantized_bits2(BaseQuantizer):
         )
         self.integer_repr_scale = integer_repr_scale
 
-    def _set_int_repr_bounds(self):
-        """Get bounds of rounded integer representation and set as attributes"""
+        # Get bounds of rounded integer representation and set as attributes
 
         unsigned_bits_po2 = K.cast_to_floatx(
             tf.bitwise.left_shift(1, self.unsigned_bits)
@@ -332,7 +293,7 @@ class quantized_bits2(BaseQuantizer):
             lambda: self._multi_bit_computation(x),
         )
 
-        return self._quantized_return(x, xq)
+        return x + self.qnoise_factor * (xq - x)
 
     def _multi_bit_computation(self, x):
         """Quantization multi-bit representation- differs for auto and static alpha"""
@@ -364,8 +325,8 @@ class quantized_bits2(BaseQuantizer):
 
         alpha_scale, xq = tf.case(
             [
-                (tf.equal(self.alpha, self.AUTO_ALPHA_ENUM), autoscale),
-                (tf.equal(self.alpha, self.AUTO_PO2_ALPHA_ENUM), po2_autoscale),
+                (tf.equal(self.alpha, tf.cast("auto", tf.string)), autoscale),
+                (tf.equal(self.alpha, tf.cast("auto_po2", tf.string)), po2_autoscale),
             ],
         )
 
@@ -381,9 +342,7 @@ class quantized_bits2(BaseQuantizer):
 
         xq = tf.where(tf.math.greater_equal(x, 0), nonneg_res, neg_res)
 
-        self.scale.assign(self.alpha)
-
-        return xq * self.alpha
+        return xq
 
     def _static_alpha_computation(self, x):
         """Compute quantized value for multi-bit quantization with static alpha"""
@@ -391,9 +350,7 @@ class quantized_bits2(BaseQuantizer):
         int_xq = self._get_quantized_integer(x, self.integer_repr_scale)
         xq = int_xq * self.integer_repr_scale
 
-        self.scale.assign(self.alpha)
-
-        return xq * self.alpha
+        return xq
 
     def _get_quantized_integer(self, x, integer_repr_scale):
         """Get x quantized in integer representation"""
@@ -487,20 +444,108 @@ class quantized_bits2(BaseQuantizer):
 
         return alpha_scale, int_xq
 
-    def _quantized_return(self, x, xq):
-        """Return quantized value, incorporating noise and gradient stopping and ste"""
-
-        return tf.cond(
-            self.use_ste,
-            lambda: x + self.qnoise_factor * (-x + xq),
-            lambda: (1 - self.qnoise_factor) * x
-            + self.qnoise_factor * xq,
-        )
-
     def _build(self):
         """Build the quantizer if not built yet."""
         if not self.built:
             self.build(var_name=self.var_name, use_variables=self.use_variables)
+
+    def __str__(self):
+        # Convert Tensors to printable strings by converting to a numpy array and
+        # then using regex to remove brackets when there is only one integer bit
+        integer_bits = re.sub(
+            r"\[(\d)\]",
+            r"\g<1>",
+            str(
+                self.integer.numpy()
+                if isinstance(self.integer, tf.Variable)
+                else self.integer
+            ),
+        )
+
+        flags = [str(self.bits), integer_bits, str(int(self.symmetric))]
+        if not self.keep_negative:
+            flags.append("keep_negative=False")
+        if self.alpha:
+            alpha = str(self.alpha)
+        if isinstance(self.alpha, six.string_types):
+            alpha = "'" + alpha + "'"
+            flags.append("alpha=" + alpha)
+        if self.use_stochastic_rounding:
+            flags.append(
+                "use_stochastic_rounding=" + str(int(self.use_stochastic_rounding))
+            )
+        return "quantized_bits(" + ",".join(flags) + ")"
+
+    def _set_trainable_parameter(self):
+        if self.alpha is None:
+            self.alpha = "auto_po2"
+            self.symmetric = True
+
+    def max(self):
+        """Get maximum value that quantized_bits class can represent."""
+        unsigned_bits = self.bits - self.keep_negative
+        if unsigned_bits > 0:
+            return max(
+                1.0,
+                np.array(
+                    K.pow(2.0, K.cast(self.integer, dtype="float32")), dtype="float32"
+                ),
+            )
+        else:
+            return 1.0
+
+    def min(self):
+        """Get minimum value that quantized_bits class can represent."""
+        if not self.keep_negative:
+            return 0.0
+        unsigned_bits = self.bits - self.keep_negative
+        if unsigned_bits > 0:
+            return -max(
+                1.0,
+                np.array(
+                    K.pow(2, K.cast(self.integer, dtype="float32")), dtype="float32"
+                ),
+            )
+        else:
+            return -1.0
+
+    def range(self):
+        """Returns a list of all values that quantized_bits can represent
+        ordered by their binary representation ascending."""
+        assert self.symmetric == 0
+        assert self.keep_negative
+        assert self.alpha is None or self.alpha == 1.0
+
+        x = np.asarray(range(2**self.bits), dtype=np.float32)
+        p_and_n = np.where(
+            x >= 2 ** (self.bits - 1),
+            (x - 2 ** (self.bits - 1)) - 2 ** (self.bits - 1),
+            x,
+        )
+        return p_and_n * np.array(
+            K.pow(2.0, -self.bits + K.cast(self.integer, dtype="float32") + 1),
+            dtype="float32",
+        )
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+    def get_config(self):
+        config = {
+            "bits": self.bits,
+            "integer": self.integer.numpy()
+            if isinstance(self.integer, tf.Variable)
+            else self.integer,
+            "symmetric": self.symmetric,
+            "alpha": self.alpha,
+            "keep_negative": self.keep_negative,
+            "use_stochastic_rounding": self.use_stochastic_rounding,
+            "qnoise_factor": self.qnoise_factor.numpy()
+            if isinstance(self.qnoise_factor, tf.Variable)
+            else self.qnoise_factor,
+        }
+        return config
 
 
 def _get_scaling_axis(scale_axis, len_axis):
