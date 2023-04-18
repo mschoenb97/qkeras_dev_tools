@@ -22,7 +22,7 @@ from timing_utils import get_time_info
 import sys
 
 
-class quantized_bits2(BaseQuantizer):
+class quantized_bits(BaseQuantizer):
     """Linear quantization with fixed number of bits.
 
     This quantizer maps values to the nearest value of a fixed number of
@@ -127,15 +127,15 @@ class quantized_bits2(BaseQuantizer):
         self.keep_negative = keep_negative
         self.qnoise_factor = qnoise_factor
         self.use_stochastic_rounding = use_stochastic_rounding
-        self.alpha = alpha
-        self.scale_axis = scale_axis
-        self.var_name = var_name
-        self.use_variables = use_variables
         # set scale as a tf.Variable so that it can be updated
         # within tf.functions
         self.scale = tf.Variable(
             1.0, name="scale", shape=tf.TensorShape(None), trainable=False
         )
+        self.alpha = alpha
+        self.scale_axis = scale_axis
+        self.var_name = var_name
+        self.use_variables = use_variables
 
         # Perform preliminary calculations based on attributes above
         self._initialized = True

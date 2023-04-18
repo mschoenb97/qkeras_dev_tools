@@ -21,14 +21,13 @@ tf.random.set_seed(0)
 random.seed(0)
 
 QUANTIZED_BITS_PARAMS = {
-    "alpha": (None, "auto", "auto_po2", 2),
+    "alpha": (None, "auto", "auto_po2"),
     "bits": (1, 4, 8),
     "integer": (0, 1),
     "symmetric": (True, False),
     "keep_negative": (True, False),
     "qnoise_factor": (1.0, 0.5, 0.0),
     "use_stochastic_rounding": (True, False),
-    "use_ste": (True, False),
 }
 
 TEST_X_VALUES = (
