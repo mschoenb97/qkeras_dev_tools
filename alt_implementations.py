@@ -330,6 +330,7 @@ class quantized_bits2(BaseQuantizer):
             ],
         )
 
+        # save scale for later computations
         self.scale.assign(alpha_scale / self.integer_repr_scale)
 
         return xq
@@ -483,31 +484,30 @@ class quantized_bits2(BaseQuantizer):
 
     def max(self):
         """Get maximum value that quantized_bits class can represent."""
-        unsigned_bits = self.bits - self.keep_negative
-        if unsigned_bits > 0:
+        if self.use_sign_function:
+            return 1.0
+        else:
             return max(
                 1.0,
                 np.array(
                     K.pow(2.0, K.cast(self.integer, dtype="float32")), dtype="float32"
                 ),
             )
-        else:
-            return 1.0
 
     def min(self):
         """Get minimum value that quantized_bits class can represent."""
         if not self.keep_negative:
             return 0.0
-        unsigned_bits = self.bits - self.keep_negative
-        if unsigned_bits > 0:
+
+        if self.use_sign_function:
+            return -1.0
+        else:
             return -max(
                 1.0,
                 np.array(
                     K.pow(2, K.cast(self.integer, dtype="float32")), dtype="float32"
                 ),
             )
-        else:
-            return -1.0
 
     def range(self):
         """Returns a list of all values that quantized_bits can represent
@@ -532,18 +532,23 @@ class quantized_bits2(BaseQuantizer):
         return cls(**config)
 
     def get_config(self):
+
+        def _convert_to_numpy(obj):
+            """Convert potential Variable to numpy for config"""
+
+            if isinstance(obj, tf.Variable):
+                return obj.numpy()
+            else:
+                return obj
+
         config = {
             "bits": self.bits,
-            "integer": self.integer.numpy()
-            if isinstance(self.integer, tf.Variable)
-            else self.integer,
+            "integer": _convert_to_numpy(self.integer),
             "symmetric": self.symmetric,
             "alpha": self.alpha,
             "keep_negative": self.keep_negative,
             "use_stochastic_rounding": self.use_stochastic_rounding,
-            "qnoise_factor": self.qnoise_factor.numpy()
-            if isinstance(self.qnoise_factor, tf.Variable)
-            else self.qnoise_factor,
+            "qnoise_factor": _convert_to_numpy(self.qnoise_factor)
         }
         return config
 
